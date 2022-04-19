@@ -76,7 +76,7 @@
 #include "binder_trace.h"
 
 static HLIST_HEAD(binder_deferred_list);
-static DEFINE_MUTEX(binder_deferred_lock);
+static DEFINE_SPINLOCK(binder_deferred_lock);
 
 static HLIST_HEAD(binder_devices);
 static HLIST_HEAD(binder_procs);
@@ -137,8 +137,7 @@ enum {
 	BINDER_DEBUG_PRIORITY_CAP           = 1U << 13,
 	BINDER_DEBUG_SPINLOCKS              = 1U << 14,
 };
-static uint32_t binder_debug_mask = BINDER_DEBUG_USER_ERROR |
-	BINDER_DEBUG_FAILED_TRANSACTION | BINDER_DEBUG_DEAD_TRANSACTION;
+static uint32_t binder_debug_mask = 0;
 module_param_named(debug_mask, binder_debug_mask, uint, 0644);
 
 static char *binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES;
@@ -287,7 +286,7 @@ struct binder_device {
 struct binder_work {
 	struct list_head entry;
 
-	enum binder_work_type {
+	enum {
 		BINDER_WORK_TRANSACTION = 1,
 		BINDER_WORK_TRANSACTION_COMPLETE,
 		BINDER_WORK_RETURN_ERROR,
@@ -359,7 +358,6 @@ struct binder_error {
  * @min_priority:         minimum scheduling priority
  *                        (invariant after initialized)
  * @inherit_rt:           inherit RT scheduling policy from caller
- * @txn_security_ctx:     require sender's security context
  *                        (invariant after initialized)
  * @async_todo:           list of async work items
  *                        (protected by @proc->inner_lock)
@@ -399,7 +397,6 @@ struct binder_node {
 		u8 sched_policy:2;
 		u8 inherit_rt:1;
 		u8 accept_fds:1;
-		u8 txn_security_ctx:1;
 		u8 min_priority;
 	};
 	bool has_async_transaction;
@@ -556,7 +553,6 @@ struct binder_proc {
 	struct task_struct *tsk;
 	struct files_struct *files;
 	struct mutex files_lock;
-	const struct cred *cred;
 	struct hlist_node deferred_work_node;
 	int deferred_work;
 	bool is_dead;
@@ -659,7 +655,6 @@ struct binder_transaction {
 	struct binder_priority	saved_priority;
 	bool    set_priority_called;
 	kuid_t	sender_euid;
-	binder_uintptr_t security_ctx;
 	/**
 	 * @lock:  protects @from, @to_proc, and @to_thread
 	 *
@@ -922,6 +917,27 @@ static struct binder_work *binder_dequeue_work_head_ilocked(
 	w = list_first_entry_or_null(list, struct binder_work, entry);
 	if (w)
 		list_del_init(&w->entry);
+	return w;
+}
+
+/**
+ * binder_dequeue_work_head() - Dequeues the item at head of list
+ * @proc:         binder_proc associated with list
+ * @list:         list to dequeue head
+ *
+ * Removes the head of the list if there are items on the list
+ *
+ * Return: pointer dequeued binder_work, NULL if list was empty
+ */
+static struct binder_work *binder_dequeue_work_head(
+					struct binder_proc *proc,
+					struct list_head *list)
+{
+	struct binder_work *w;
+
+	binder_inner_proc_lock(proc);
+	w = binder_dequeue_work_head_ilocked(list);
+	binder_inner_proc_unlock(proc);
 	return w;
 }
 
@@ -1348,7 +1364,6 @@ static struct binder_node *binder_init_node_ilocked(
 	node->min_priority = to_kernel_prio(node->sched_policy, priority);
 	node->accept_fds = !!(flags & FLAT_BINDER_FLAG_ACCEPTS_FDS);
 	node->inherit_rt = !!(flags & FLAT_BINDER_FLAG_INHERIT_RT);
-	node->txn_security_ctx = 0; /*!!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX);*/
 	spin_lock_init(&node->lock);
 	INIT_LIST_HEAD(&node->work.entry);
 	INIT_LIST_HEAD(&node->async_todo);
@@ -2508,7 +2523,7 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 		ret = -EINVAL;
 		goto done;
 	}
-	if (security_binder_transfer_binder(proc->cred, target_proc->cred)) {
+	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2554,7 +2569,7 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
 	}
-	if (security_binder_transfer_binder(proc->cred, target_proc->cred)) {
+	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2638,7 +2653,7 @@ static int binder_translate_fd(int fd,
 		ret = -EBADF;
 		goto err_fget;
 	}
-	ret = security_binder_transfer_file(proc->cred, target_proc->cred, file);
+	ret = security_binder_transfer_file(proc->tsk, target_proc->tsk, file);
 	if (ret < 0) {
 		ret = -EPERM;
 		goto err_security;
@@ -2804,7 +2819,15 @@ static bool binder_proc_transaction(struct binder_transaction *t,
 	if (oneway) {
 		BUG_ON(thread);
 		if (node->has_async_transaction) {
-			pending_async = true;
+			if (!strcmp(proc->context->name, "hwbinder")) {
+				// Halium: possible libgbinder bug workaround
+				pr_info("%d has pending async transaction, but still adding a new transaction to todo list (gbinder bug workaround)\n",
+						proc->pid);
+			} else {
+				pr_info("%d not applying gbinder workaround, context %s is not hwbinder\n",
+						proc->pid, proc->context->name);
+				pending_async = true;
+			}
 		} else {
 			node->has_async_transaction = true;
 		}
@@ -2905,8 +2928,6 @@ static void binder_transaction(struct binder_proc *proc,
 	binder_size_t last_fixup_min_off = 0;
 	struct binder_context *context = proc->context;
 	int t_debug_id = atomic_inc_return(&binder_last_id);
-	char *secctx = NULL;
-	u32 secctx_sz = 0;
 
 	e = binder_transaction_log_add(&binder_transaction_log);
 	e->debug_id = t_debug_id;
@@ -3029,8 +3050,8 @@ static void binder_transaction(struct binder_proc *proc,
 			return_error_line = __LINE__;
 			goto err_invalid_target_handle;
 		}
-		if (security_binder_transaction(proc->cred,
-						target_proc->cred) < 0) {
+		if (security_binder_transaction(proc->tsk,
+						target_proc->tsk) < 0) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPERM;
 			return_error_line = __LINE__;
@@ -3136,29 +3157,6 @@ static void binder_transaction(struct binder_proc *proc,
 		t->priority = target_proc->default_priority;
 	}
 
-	if (target_node && target_node->txn_security_ctx) {
-		u32 secid;
-		size_t added_size;
-
-		security_task_getsecid(proc->tsk, &secid);
-		ret = security_secid_to_secctx(secid, &secctx, &secctx_sz);
-		if (ret) {
-			return_error = BR_FAILED_REPLY;
-			return_error_param = ret;
-			return_error_line = __LINE__;
-			goto err_get_secctx_failed;
-		}
-		added_size = ALIGN(secctx_sz, sizeof(u64));
-		extra_buffers_size += added_size;
-		if (extra_buffers_size < added_size) {
-			/* integer overflow of extra_buffers_size */
-			return_error = BR_FAILED_REPLY;
-			return_error_param = EINVAL;
-			return_error_line = __LINE__;
-			goto err_bad_extra_size;
-		}
-	}
-
 	trace_binder_transaction(reply, t, target_node);
 
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
@@ -3174,19 +3172,6 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		t->buffer = NULL;
 		goto err_binder_alloc_buf_failed;
-	}
-	if (secctx) {
-		size_t buf_offset = ALIGN(tr->data_size, sizeof(void *)) +
-				    ALIGN(tr->offsets_size, sizeof(void *)) +
-				    ALIGN(extra_buffers_size, sizeof(void *)) -
-				    ALIGN(secctx_sz, sizeof(u64));
-		char *kptr = t->buffer->data + buf_offset;
-
-		t->security_ctx = (uintptr_t)kptr +
-		    binder_alloc_get_user_buffer_offset(&target_proc->alloc);
-		memcpy(kptr, secctx, secctx_sz);
-		security_release_secctx(secctx, secctx_sz);
-		secctx = NULL;
 	}
 	t->buffer->debug_id = t->debug_id;
 	t->buffer->transaction = t;
@@ -3223,7 +3208,7 @@ static void binder_transaction(struct binder_proc *proc,
 		goto err_bad_offset;
 	}
 	if (!IS_ALIGNED(extra_buffers_size, sizeof(u64))) {
-		binder_user_error("%d:%d got transaction with unaligned buffers size, %lld\n",
+		binder_user_error("%d:%d got transaction with unaligned buffers size, %llu\n",
 				  proc->pid, thread->pid,
 				  (u64)extra_buffers_size);
 		return_error = BR_FAILED_REPLY;
@@ -3233,8 +3218,7 @@ static void binder_transaction(struct binder_proc *proc,
 	}
 	off_end = (void *)off_start + tr->offsets_size;
 	sg_bufp = (u8 *)(PTR_ALIGN(off_end, sizeof(void *)));
-	sg_buf_end = sg_bufp + extra_buffers_size -
-		ALIGN(secctx_sz, sizeof(u64));
+	sg_buf_end = sg_bufp + extra_buffers_size;
 	off_min = 0;
 	for (; offp < off_end; offp++) {
 		struct binder_object_header *hdr;
@@ -3459,10 +3443,6 @@ err_copy_data_failed:
 	t->buffer->transaction = NULL;
 	binder_alloc_free_buf(&target_proc->alloc, t->buffer);
 err_binder_alloc_buf_failed:
-err_bad_extra_size:
-	if (secctx)
-		security_release_secctx(secctx, secctx_sz);
-err_get_secctx_failed:
 	kfree(tcomplete);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
 err_alloc_tcomplete_failed:
@@ -3727,7 +3707,8 @@ static int binder_thread_write(struct binder_proc *proc,
 
 				buf_node = buffer->target_node;
 				binder_node_inner_lock(buf_node);
-				BUG_ON(!buf_node->has_async_transaction);
+				// Halium: possible libgbinder bug workaround
+				/*BUG_ON(!buf_node->has_async_transaction);*/
 				BUG_ON(buf_node->proc != proc);
 				w = binder_dequeue_work_head_ilocked(
 						&buf_node->async_todo);
@@ -4118,13 +4099,11 @@ retry:
 
 	while (1) {
 		uint32_t cmd;
-		struct binder_transaction_data_secctx tr;
-		struct binder_transaction_data *trd = &tr.transaction_data;
+		struct binder_transaction_data tr;
 		struct binder_work *w = NULL;
 		struct list_head *list = NULL;
 		struct binder_transaction *t = NULL;
 		struct binder_thread *t_from;
-		size_t trsize = sizeof(*trd);
 
 		binder_inner_proc_lock(proc);
 		if (!binder_worklist_empty_ilocked(&thread->todo))
@@ -4166,7 +4145,7 @@ retry:
 			e->cmd = BR_OK;
 			ptr += sizeof(uint32_t);
 
-			binder_stat_br(proc, thread, e->cmd);
+			binder_stat_br(proc, thread, cmd);
 		} break;
 		case BINDER_WORK_TRANSACTION_COMPLETE: {
 			binder_inner_proc_unlock(proc);
@@ -4320,21 +4299,21 @@ retry:
 			struct binder_node *target_node = t->buffer->target_node;
 			struct binder_priority node_prio;
 
-			trd->target.ptr = target_node->ptr;
-			trd->cookie =  target_node->cookie;
+			tr.target.ptr = target_node->ptr;
+			tr.cookie =  target_node->cookie;
 			node_prio.sched_policy = target_node->sched_policy;
 			node_prio.prio = target_node->min_priority;
 			binder_transaction_priority(current, t, node_prio,
 						    target_node->inherit_rt);
 			cmd = BR_TRANSACTION;
 		} else {
-			trd->target.ptr = 0;
-			trd->cookie = 0;
+			tr.target.ptr = 0;
+			tr.cookie = 0;
 			cmd = BR_REPLY;
 		}
-		trd->code = t->code;
-		trd->flags = t->flags;
-		trd->sender_euid = from_kuid(current_user_ns(), t->sender_euid);
+		tr.code = t->code;
+		tr.flags = t->flags;
+		tr.sender_euid = from_kuid(current_user_ns(), t->sender_euid);
 
 		t_from = binder_get_txn_from(t);
 		if (t_from) {
@@ -4346,23 +4325,18 @@ retry:
 			if (binder_global_pid_lookups && tr.sender_pid == 0)
 				tr.sender_pid = task_tgid_nr(sender);
 		} else {
-			trd->sender_pid = 0;
+			tr.sender_pid = 0;
 		}
 
-		trd->data_size = t->buffer->data_size;
-		trd->offsets_size = t->buffer->offsets_size;
-		trd->data.ptr.buffer = (binder_uintptr_t)
+		tr.data_size = t->buffer->data_size;
+		tr.offsets_size = t->buffer->offsets_size;
+		tr.data.ptr.buffer = (binder_uintptr_t)
 			((uintptr_t)t->buffer->data +
 			binder_alloc_get_user_buffer_offset(&proc->alloc));
-		trd->data.ptr.offsets = trd->data.ptr.buffer +
+		tr.data.ptr.offsets = tr.data.ptr.buffer +
 					ALIGN(t->buffer->data_size,
 					    sizeof(void *));
 
-		tr.secctx = t->security_ctx;
-		if (t->security_ctx) {
-			cmd = BR_TRANSACTION_SEC_CTX;
-			trsize = sizeof(tr);
-		}
 		if (put_user(cmd, (uint32_t __user *)ptr)) {
 			if (t_from)
 				binder_thread_dec_tmpref(t_from);
@@ -4373,7 +4347,7 @@ retry:
 			return -EFAULT;
 		}
 		ptr += sizeof(uint32_t);
-		if (copy_to_user(ptr, &tr, trsize)) {
+		if (copy_to_user(ptr, &tr, sizeof(tr))) {
 			if (t_from)
 				binder_thread_dec_tmpref(t_from);
 
@@ -4382,7 +4356,7 @@ retry:
 
 			return -EFAULT;
 		}
-		ptr += trsize;
+		ptr += sizeof(tr);
 
 		trace_binder_transaction_received(t);
 		binder_stat_br(proc, thread, cmd);
@@ -4390,18 +4364,16 @@ retry:
 			     "%d:%d %s %d %d:%d, cmd %d size %zd-%zd ptr %016llx-%016llx\n",
 			     proc->pid, thread->pid,
 			     (cmd == BR_TRANSACTION) ? "BR_TRANSACTION" :
-				(cmd == BR_TRANSACTION_SEC_CTX) ?
-				     "BR_TRANSACTION_SEC_CTX" : "BR_REPLY",
+			     "BR_REPLY",
 			     t->debug_id, t_from ? t_from->proc->pid : 0,
 			     t_from ? t_from->pid : 0, cmd,
 			     t->buffer->data_size, t->buffer->offsets_size,
-			     (u64)trd->data.ptr.buffer,
-			     (u64)trd->data.ptr.offsets);
+			     (u64)tr.data.ptr.buffer, (u64)tr.data.ptr.offsets);
 
 		if (t_from)
 			binder_thread_dec_tmpref(t_from);
 		t->buffer->allow_user_free = 1;
-		if (cmd != BR_REPLY && !(t->flags & TF_ONE_WAY)) {
+		if (cmd == BR_TRANSACTION && !(t->flags & TF_ONE_WAY)) {
 			binder_inner_proc_lock(thread->proc);
 			t->to_parent = thread->transaction_stack;
 			t->to_thread = thread;
@@ -4440,17 +4412,13 @@ static void binder_release_work(struct binder_proc *proc,
 				struct list_head *list)
 {
 	struct binder_work *w;
-	enum binder_work_type wtype;
 
 	while (1) {
-		binder_inner_proc_lock(proc);
-		w = binder_dequeue_work_head_ilocked(list);
-		wtype = w ? w->type : 0;
-		binder_inner_proc_unlock(proc);
+		w = binder_dequeue_work_head(proc, list);
 		if (!w)
 			return;
 
-		switch (wtype) {
+		switch (w->type) {
 		case BINDER_WORK_TRANSACTION: {
 			struct binder_transaction *t;
 
@@ -4484,11 +4452,9 @@ static void binder_release_work(struct binder_proc *proc,
 			kfree(death);
 			binder_stats_deleted(BINDER_STAT_DEATH);
 		} break;
-		case BINDER_WORK_NODE:
-			break;
 		default:
 			pr_err("unexpected work type, %d, not freed\n",
-			       wtype);
+			       w->type);
 			break;
 		}
 	}
@@ -4562,7 +4528,6 @@ static void binder_free_proc(struct binder_proc *proc)
 	BUG_ON(!list_empty(&proc->delivered_death));
 	binder_alloc_deferred_release(&proc->alloc);
 	put_task_struct(proc->tsk);
-	put_cred(proc->cred);
 	binder_stats_deleted(BINDER_STAT_PROC);
 	kfree(proc);
 }
@@ -4634,20 +4599,23 @@ static int binder_thread_release(struct binder_proc *proc,
 	}
 
 	/*
-	 * If this thread used poll, make sure we remove the waitqueue from any
-	 * poll data structures holding it.
+	 * If this thread used poll, make sure we remove the waitqueue
+	 * from any epoll data structures holding it with POLLFREE.
+	 * waitqueue_active() is safe to use here because we're holding
+	 * the inner lock.
 	 */
-	if (thread->looper & BINDER_LOOPER_STATE_POLL)
-		wake_up_pollfree(&thread->wait);
+	if ((thread->looper & BINDER_LOOPER_STATE_POLL) &&
+	    waitqueue_active(&thread->wait)) {
+		wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
+	}
 
 	binder_inner_proc_unlock(thread->proc);
 
 	/*
-	 * This is needed to avoid races between wake_up_pollfree() above and
-	 * someone else removing the last entry from the queue for other reasons
-	 * (e.g. ep_remove_wait_queue() being called due to an epoll file
-	 * descriptor being closed).  Such other users hold an RCU read lock, so
-	 * we can be sure they're done after we call synchronize_rcu().
+	 * This is needed to avoid races between wake_up_poll() above and
+	 * and ep_remove_waitqueue() called for other reasons (eg the epoll file
+	 * descriptor being closed); ep_remove_waitqueue() holds an RCU read
+	 * lock, so we can be sure it's done after calling synchronize_rcu().
 	 */
 	if (thread->looper & BINDER_LOOPER_STATE_POLL)
 		synchronize_rcu();
@@ -4750,8 +4718,7 @@ out:
 	return ret;
 }
 
-static int binder_ioctl_set_ctx_mgr(struct file *filp,
-				    struct flat_binder_object *fbo)
+static int binder_ioctl_set_ctx_mgr(struct file *filp)
 {
 	int ret = 0;
 	struct binder_proc *proc = filp->private_data;
@@ -4765,7 +4732,7 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp,
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = security_binder_set_context_mgr(proc->cred);
+	ret = security_binder_set_context_mgr(proc->tsk);
 	if (ret < 0)
 		goto out;
 	if (uid_valid(context->binder_context_mgr_uid)) {
@@ -4780,7 +4747,7 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp,
 	} else {
 		context->binder_context_mgr_uid = curr_euid;
 	}
-	new_node = binder_new_node(proc, fbo);
+	new_node = binder_new_node(proc, NULL);
 	if (!new_node) {
 		ret = -ENOMEM;
 		goto out;
@@ -4796,6 +4763,42 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp,
 out:
 	mutex_unlock(&context->context_mgr_node_lock);
 	return ret;
+}
+
+static int binder_ioctl_get_node_info_for_ref(struct binder_proc *proc,
+		struct binder_node_info_for_ref *info)
+{
+	struct binder_node *node;
+	struct binder_context *context = proc->context;
+	__u32 handle = info->handle;
+
+	if (info->strong_count || info->weak_count || info->reserved1 ||
+	    info->reserved2 || info->reserved3) {
+		binder_user_error("%d BINDER_GET_NODE_INFO_FOR_REF: only handle may be non-zero.",
+				  proc->pid);
+		return -EINVAL;
+	}
+
+	/* This ioctl may only be used by the context manager */
+	mutex_lock(&context->context_mgr_node_lock);
+	if (!context->binder_context_mgr_node ||
+		context->binder_context_mgr_node->proc != proc) {
+		mutex_unlock(&context->context_mgr_node_lock);
+		return -EPERM;
+	}
+	mutex_unlock(&context->context_mgr_node_lock);
+
+	node = binder_get_node_from_ref(proc, handle, true, NULL);
+	if (!node)
+		return -EINVAL;
+
+	info->strong_count = node->local_strong_refs +
+		node->internal_strong_refs;
+	info->weak_count = node->local_weak_refs;
+
+	binder_put_node(node);
+
+	return 0;
 }
 
 static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
@@ -4866,20 +4869,8 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_inner_proc_unlock(proc);
 		break;
 	}
-	case BINDER_SET_CONTEXT_MGR_EXT: {
-		struct flat_binder_object fbo;
-
-		if (copy_from_user(&fbo, ubuf, sizeof(fbo))) {
-			ret = -EINVAL;
-			goto err;
-		}
-		ret = binder_ioctl_set_ctx_mgr(filp, &fbo);
-		if (ret)
-			goto err;
-		break;
-	}
 	case BINDER_SET_CONTEXT_MGR:
-		ret = binder_ioctl_set_ctx_mgr(filp, NULL);
+		ret = binder_ioctl_set_ctx_mgr(filp);
 		if (ret)
 			goto err;
 		break;
@@ -4901,6 +4892,25 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL;
 			goto err;
 		}
+		break;
+	}
+	case BINDER_GET_NODE_INFO_FOR_REF: {
+		struct binder_node_info_for_ref info;
+
+		if (copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		ret = binder_ioctl_get_node_info_for_ref(proc, &info);
+		if (ret < 0)
+			goto err;
+
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+
 		break;
 	}
 	case BINDER_GET_NODE_DEBUG_INFO: {
@@ -5031,7 +5041,6 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	atomic_set(&proc->tmp_ref, 0);
 	get_task_struct(current->group_leader);
 	proc->tsk = current->group_leader;
-	proc->cred = get_cred(filp->f_cred);
 	mutex_init(&proc->files_lock);
 	INIT_LIST_HEAD(&proc->todo);
 	if (binder_supported_policy(current->policy)) {
@@ -5277,7 +5286,7 @@ static void binder_deferred_func(struct work_struct *work)
 	int defer;
 
 	do {
-		mutex_lock(&binder_deferred_lock);
+		spin_lock(&binder_deferred_lock);
 		if (!hlist_empty(&binder_deferred_list)) {
 			proc = hlist_entry(binder_deferred_list.first,
 					struct binder_proc, deferred_work_node);
@@ -5288,7 +5297,7 @@ static void binder_deferred_func(struct work_struct *work)
 			proc = NULL;
 			defer = 0;
 		}
-		mutex_unlock(&binder_deferred_lock);
+		spin_unlock(&binder_deferred_lock);
 
 		files = NULL;
 		if (defer & BINDER_DEFERRED_PUT_FILES) {
@@ -5314,14 +5323,14 @@ static DECLARE_WORK(binder_deferred_work, binder_deferred_func);
 static void
 binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer)
 {
-	mutex_lock(&binder_deferred_lock);
+	spin_lock(&binder_deferred_lock);
 	proc->deferred_work |= defer;
 	if (hlist_unhashed(&proc->deferred_work_node)) {
 		hlist_add_head(&proc->deferred_work_node,
 				&binder_deferred_list);
 		queue_work(binder_deferred_workqueue, &binder_deferred_work);
 	}
-	mutex_unlock(&binder_deferred_lock);
+	spin_unlock(&binder_deferred_lock);
 }
 
 static void print_binder_transaction_ilocked(struct seq_file *m,
@@ -5512,6 +5521,9 @@ static void print_binder_proc(struct seq_file *m,
 	for (n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
 		struct binder_node *node = rb_entry(n, struct binder_node,
 						    rb_node);
+		if (!print_all && !node->has_async_transaction)
+			continue;
+
 		/*
 		 * take a temporary reference on the node so it
 		 * survives and isn't removed from the tree
